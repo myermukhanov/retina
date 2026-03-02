@@ -80,6 +80,9 @@ pub(crate) struct Depacketizer {
     /// True if we've seen a FU-A sequence where the NAL headers differ between
     /// fragments.
     seen_inconsistent_fu_a_nal_hdr: bool,
+
+    /// Count of skipped corrupt packets (for rate-limited logging).
+    skipped_corrupt_packets: u64,
 }
 
 #[derive(Debug)]
@@ -229,6 +232,7 @@ impl Depacketizer {
             nals: Vec::new(),
             parameters,
             seen_inconsistent_fu_a_nal_hdr: false,
+            skipped_corrupt_packets: 0,
         })
     }
 
@@ -368,67 +372,85 @@ impl Depacketizer {
         let mut data = pkt.into_payload_bytes();
         // https://tools.ietf.org/html/rfc6184#section-5.2
         let Some(&nal_header) = data.first() else {
-            return Err("Empty NAL".into());
+            self.skip_corrupt_nal("Empty NAL");
+            return Ok(());
         };
         if (nal_header >> 7) != 0 {
-            return Err(format!("NAL header {nal_header:02x} has F bit set"));
+            self.skip_corrupt_nal(&format!("NAL header {nal_header:02x} has F bit set"));
+            return Ok(());
         }
         match nal_header & 0b11111 {
             1..=23 => {
                 if access_unit.fu_a.is_some() {
-                    return Err(format!(
+                    self.skip_corrupt_nal(&format!(
                         "Non-fragmented NAL {nal_header:02x} while FU-A fragment in progress"
                     ));
+                    return Ok(());
                 }
-                process_annex_b(data, |nal| self.add_single_nal(nal))?;
+                if let Err(e) = process_annex_b(data, |nal| self.add_single_nal(nal)) {
+                    self.skip_corrupt_nal(&e);
+                    return Ok(());
+                }
             }
             24 => {
                 // STAP-A. https://tools.ietf.org/html/rfc6184#section-5.7.1
                 data.advance(1);
                 if access_unit.fu_a.is_some() {
-                    return Err("STAP-A NAL while FU-A fragment in progress".into());
+                    self.skip_corrupt_nal("STAP-A NAL while FU-A fragment in progress");
+                    return Ok(());
                 }
                 loop {
                     if data.remaining() < 3 {
-                        return Err(format!(
+                        self.skip_corrupt_nal(&format!(
                             "STAP-A has {} remaining bytes; expecting 2-byte length, non-empty NAL",
                             data.remaining()
                         ));
+                        return Ok(());
                     }
                     let len = data.get_u16();
                     if len == 0 {
-                        return Err("zero length in STAP-A".into());
+                        self.skip_corrupt_nal("zero length in STAP-A");
+                        return Ok(());
                     }
                     match data.remaining().cmp(&(usize::from(len))) {
                         std::cmp::Ordering::Less => {
-                            return Err(format!(
+                            self.skip_corrupt_nal(&format!(
                                 "STAP-A too short: {} bytes remaining, expecting hdr + {}-byte NAL",
                                 data.remaining(),
                                 len
                             ));
+                            return Ok(());
                         }
                         std::cmp::Ordering::Equal => {
-                            process_annex_b(data, |nal| self.add_single_nal(nal))?;
+                            if let Err(e) = process_annex_b(data, |nal| self.add_single_nal(nal)) {
+                                self.skip_corrupt_nal(&e);
+                                return Ok(());
+                            }
                             break;
                         }
                         std::cmp::Ordering::Greater => {
-                            process_annex_b(data.split_to(usize::from(len)), |nal| {
+                            if let Err(e) = process_annex_b(data.split_to(usize::from(len)), |nal| {
                                 self.add_single_nal(nal)
-                            })?;
+                            }) {
+                                self.skip_corrupt_nal(&e);
+                                return Ok(());
+                            }
                         }
                     }
                 }
             }
             25..=27 | 29 => {
-                return Err(format!(
+                self.skip_corrupt_nal(&format!(
                     "unimplemented/unexpected interleaved mode NAL ({nal_header:02x})",
                 ));
+                return Ok(());
             }
             28 => {
                 // FU-A. https://tools.ietf.org/html/rfc6184#section-5.8
                 if data.len() < 3 {
                     // NAL + FU-A headers take 2 byte; need at least 3 bytes to make progress.
-                    return Err(format!("FU-A len {} too short", data.len()));
+                    self.skip_corrupt_nal(&format!("FU-A len {} too short", data.len()));
+                    return Ok(());
                 }
                 let fu_header = data[1];
                 let start = (fu_header & 0b10000000) != 0;
@@ -439,14 +461,17 @@ impl Depacketizer {
                         .expect("NalHeader is valid");
                 data.advance(2);
                 if start && end {
-                    return Err(format!("Invalid FU-A header {fu_header:02x}"));
+                    self.skip_corrupt_nal(&format!("Invalid FU-A header {fu_header:02x}"));
+                    return Ok(());
                 }
                 if !end && mark {
-                    return Err("FU-A pkt with MARK && !END".into());
+                    self.skip_corrupt_nal("FU-A pkt with MARK && !END");
+                    return Ok(());
                 }
                 match (start, access_unit.fu_a.take()) {
                     (true, Some(_)) => {
-                        return Err("FU-A with start bit while frag in progress".into());
+                        self.skip_corrupt_nal("FU-A with start bit while frag in progress");
+                        return Ok(());
                     }
                     (true, None) => {
                         let mut cur_nal = Some(CurFuANal {
@@ -454,7 +479,10 @@ impl Depacketizer {
                             trailing_zeros: 0,
                             pieces_bytes: 0,
                         });
-                        self.add_fu_a(&mut cur_nal, data)?;
+                        if let Err(e) = self.add_fu_a(&mut cur_nal, data) {
+                            self.skip_corrupt_nal(&e);
+                            return Ok(());
+                        }
                         access_unit.fu_a = Some(FuA {
                             initial_nal_header: nal_header,
                             cur_nal,
@@ -471,19 +499,35 @@ impl Depacketizer {
                             );
                             self.seen_inconsistent_fu_a_nal_hdr = true;
                         }
-                        self.add_fu_a(&mut fu_a.cur_nal, data)?;
+                        if let Err(e) = self.add_fu_a(&mut fu_a.cur_nal, data) {
+                            self.skip_corrupt_nal(&e);
+                            return Ok(());
+                        }
                         if end {
                             if let Some(cur_nal) = fu_a.cur_nal {
+                                let next_piece_idx = match u32::try_from(self.pieces.len()) {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        self.skip_corrupt_nal("more than u32::MAX pieces");
+                                        return Ok(());
+                                    }
+                                };
+                                let len = match u32::try_from(cur_nal.pieces_bytes + 1) {
+                                    Ok(v) => v,
+                                    Err(_) => {
+                                        self.skip_corrupt_nal("excessively long FU-A NAL");
+                                        return Ok(());
+                                    }
+                                };
                                 self.nals.push(Nal {
                                     hdr: cur_nal.hdr,
-                                    next_piece_idx: u32::try_from(self.pieces.len())
-                                        .map_err(|_| "more than u32::MAX pieces!")?,
-                                    len: u32::try_from(cur_nal.pieces_bytes + 1)
-                                        .map_err(|_| "excessively long FU-A NAL")?,
+                                    next_piece_idx,
+                                    len,
                                 });
                             }
                         } else if mark {
-                            return Err("FU-A has MARK and no END".into());
+                            self.skip_corrupt_nal("FU-A has MARK and no END");
+                            return Ok(());
                         } else {
                             access_unit.fu_a = Some(fu_a);
                         }
@@ -498,11 +542,15 @@ impl Depacketizer {
                             };
                             return Ok(());
                         }
-                        return Err("FU-A has start bit unset while no frag in progress".into());
+                        self.skip_corrupt_nal("FU-A has start bit unset while no frag in progress");
+                        return Ok(());
                     }
                 }
             }
-            _ => return Err(format!("bad nal header {nal_header:02x}")),
+            _ => {
+                self.skip_corrupt_nal(&format!("bad nal header {nal_header:02x}"));
+                return Ok(());
+            }
         }
         self.input_state = if mark {
             match self.nals.last() {
@@ -523,6 +571,25 @@ impl Depacketizer {
             DepacketizerInputState::PreMark(access_unit)
         };
         Ok(())
+    }
+
+    /// Skip a corrupt NAL packet: clear accumulated state and log warning.
+    /// After mem::replace at the top of push(), input_state is already New,
+    /// so clearing nals/pieces returns the depacketizer to a clean slate.
+    /// The stream will resync on the next IDR keyframe.
+    fn skip_corrupt_nal(&mut self, reason: &str) {
+        self.skipped_corrupt_packets += 1;
+        // Log every skip for the first 10, then every 100th
+        if self.skipped_corrupt_packets <= 10
+            || self.skipped_corrupt_packets % 100 == 0
+        {
+            log::warn!(
+                "Skipping corrupt packet (#{total}): {reason}",
+                total = self.skipped_corrupt_packets,
+            );
+        }
+        self.nals.clear();
+        self.pieces.clear();
     }
 
     pub(super) fn pull(&mut self) -> Option<Result<CodecItem, DepacketizeError>> {

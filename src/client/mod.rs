@@ -1160,6 +1160,9 @@ struct SessionInner {
     /// The state of the keepalive request; only used in state `Playing`.
     keepalive_state: KeepaliveState,
 
+    /// Number of consecutive missed keepalive responses.
+    keepalive_misses: u8,
+
     keepalive_timer: Option<Pin<Box<tokio::time::Sleep>>>,
 
     /// Bitmask of [`SessionFlag`]s.
@@ -1529,6 +1532,7 @@ impl Session<Described> {
                 describe_cseq: cseq,
                 describe_status,
                 keepalive_state: KeepaliveState::Idle,
+                keepalive_misses: 0,
                 keepalive_timer: None,
                 flags: 0,
                 udp_next_poll_i: 0,
@@ -2113,16 +2117,31 @@ impl Session<Playing> {
                     format!("Unable to write keepalive {cseq} within {keepalive_interval:?}",),
                 ),
             }),
-            KeepaliveState::Waiting { cseq, .. } => bail!(ErrorInt::RtspReadError {
-                conn_ctx: *conn.inner.ctx(),
-                msg_ctx: conn.inner.eof_ctx(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!(
-                        "Server failed to respond to keepalive {cseq} within {keepalive_interval:?}",
-                    ),
-                ),
-            }),
+            KeepaliveState::Waiting { cseq, .. } => {
+                // Allow 1 missed keepalive before killing the session.
+                // This gives cameras 2x the keepalive interval to respond,
+                // reducing false disconnects from temporarily busy cameras.
+                if *inner.keepalive_misses < 1 {
+                    *inner.keepalive_misses += 1;
+                    log::warn!(
+                        "Keepalive {cseq} missed (miss {}/2), retrying",
+                        inner.keepalive_misses,
+                    );
+                    // Fall through to send a new keepalive
+                } else {
+                    bail!(ErrorInt::RtspReadError {
+                        conn_ctx: *conn.inner.ctx(),
+                        msg_ctx: conn.inner.eof_ctx(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "Server failed to respond to keepalive {cseq} within {keepalive_interval:?} (after {} missed)",
+                                *inner.keepalive_misses + 1,
+                            ),
+                        ),
+                    });
+                }
+            }
             KeepaliveState::Idle => {}
         }
 
@@ -2212,6 +2231,7 @@ impl Session<Playing> {
                     }
                 }
                 *inner.keepalive_state = KeepaliveState::Idle;
+                *inner.keepalive_misses = 0;
                 return Ok(());
             }
             _ => {}
@@ -2643,7 +2663,15 @@ impl futures::Stream for Demuxed {
                     Some(Ok(PacketItem::Rtcp(p))) => {
                         return Poll::Ready(Some(Ok(CodecItem::Rtcp(p))));
                     }
-                    Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+                    Some(Err(e)) => {
+                        // Skip recoverable packet-level errors (corrupt RTP headers,
+                        // corrupt RTCP). Connection-level errors still propagate.
+                        if matches!(e.0.as_ref(), ErrorInt::PacketError { .. }) {
+                            log::warn!("Skipping corrupt RTP packet: {e}");
+                            continue;
+                        }
+                        return Poll::Ready(Some(Err(e)));
+                    }
                     None => return Poll::Ready(None),
                 },
                 DemuxedState::Pulling(stream_id) => (stream_id, None),
@@ -2701,18 +2729,12 @@ impl futures::Stream for Demuxed {
                     continue;
                 }
                 Some(Err(e)) => {
-                    let conn_ctx = *conn_ctx;
-                    let stream_ctx = *stream_ctx;
-                    self.state = DemuxedState::Fused;
-                    return Poll::Ready(Some(Err(Error(Arc::new(ErrorInt::RtpPacketError {
-                        conn_ctx,
-                        stream_ctx,
-                        pkt_ctx: e.pkt_ctx,
-                        stream_id,
-                        ssrc: e.ssrc,
-                        sequence_number: e.sequence_number,
-                        description: e.description,
-                    })))));
+                    // Skip depacketizer pull errors instead of fusing the stream.
+                    // This allows recovery after corrupt packets (e.g. mid-FU-A
+                    // timestamp change). The stream will resync on the next keyframe.
+                    log::warn!("Skipping depacketizer error: {}", e.description);
+                    self.state = DemuxedState::Waiting;
+                    continue;
                 }
             }
         }
