@@ -163,22 +163,26 @@ impl InorderParser {
 
         let sequence_number = raw.sequence_number();
         let ssrc = raw.ssrc();
-        let loss =
+        let mut loss =
             sequence_number.wrapping_sub(self.seq.map(|s| s.next).unwrap_or(sequence_number));
         if matches!(self.ssrc, Some(s) if s.ssrc != ssrc) {
-            note_stale_live555_data_if_tcp(tool, session_options, conn_ctx, stream_ctx, pkt_ctx);
-            bail!(ErrorInt::RtpPacketError {
-                conn_ctx: *conn_ctx,
-                pkt_ctx: *pkt_ctx,
-                stream_ctx: stream_ctx.to_owned(),
-                stream_id,
+            // Camera encoder restarted mid-session (common on AI cameras under load,
+            // e.g. Hikvision iDS-2CD9396 running LPR+radar). RFC 3550 §8.2 allows SSRC
+            // changes with a RTCP BYE, but these cameras just change SSRC silently.
+            // Accept the new SSRC instead of disconnecting — the new encoder session
+            // will begin with an IDR keyframe, allowing the decoder to resync.
+            warn!(
+                "SSRC changed after {} RTP pkts + {} RTCP pkts; \
+                 old={:?} new=0x{:08x} — accepting new SSRC (camera encoder restart)",
+                self.seen_rtp_packets, self.seen_rtcp_packets, self.ssrc, ssrc,
+            );
+            self.ssrc = Some(Ssrc {
+                init: InitialExpectation::RtpPacket,
                 ssrc,
-                sequence_number,
-                description: format!(
-                    "wrong ssrc after {} RTP pkts + {} RTCP pkts; expecting ssrc={:?} seq={:?}",
-                    self.seen_rtp_packets, self.seen_rtcp_packets, self.ssrc, self.seq,
-                ),
             });
+            self.seq = None;
+            loss = 0; // seq counter restarted; suppress large-loss error below
+            timeline.reset(raw.timestamp()); // RTP timestamp also restarted
         } else if self.ssrc.is_none() {
             self.ssrc = Some(Ssrc {
                 init: InitialExpectation::RtpPacket,

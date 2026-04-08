@@ -75,6 +75,13 @@ impl Timeline {
         Ok(timestamp)
     }
 
+    /// Resets the timeline to a new starting point.
+    /// Called when the RTP source (SSRC) changes mid-session due to camera encoder restart.
+    pub fn reset(&mut self, new_start: u32) {
+        self.start = Some(new_start);
+        self.timestamp = i64::from(new_start);
+    }
+
     /// Places `rtp_timestamp` on the timeline without advancing the timeline
     /// or applying time jump policy. Will set the NPT epoch if unset.
     ///
