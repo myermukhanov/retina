@@ -75,6 +75,13 @@ pub struct InorderParser {
     /// Total RTCP packets seen in this stream.
     seen_rtcp_packets: u64,
 
+    /// Number of times the SSRC has changed mid-session. Incremented when
+    /// the camera silently restarts its encoder (common on AI cameras under
+    /// load). Consumers can poll this counter to detect a session restart and
+    /// roll their MP4 segment so post-restart frames don't reference the
+    /// previous encoder's lost reference frames.
+    ssrc_change_count: u64,
+
     unknown_rtcp_session: UnknownRtcpSsrcPolicy,
     seen_unknown_rtcp_session: bool,
 }
@@ -118,9 +125,17 @@ impl InorderParser {
             }),
             seen_rtp_packets: 0,
             seen_rtcp_packets: 0,
+            ssrc_change_count: 0,
             unknown_rtcp_session,
             seen_unknown_rtcp_session: false,
         }
+    }
+
+    /// Returns how many times the SSRC has changed mid-session. Consumers
+    /// poll this between frames to detect a silent encoder restart and
+    /// roll their MP4 segment.
+    pub fn ssrc_change_count(&self) -> u64 {
+        self.ssrc_change_count
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -169,8 +184,11 @@ impl InorderParser {
             // Camera encoder restarted mid-session (common on AI cameras under load,
             // e.g. Hikvision iDS-2CD9396 running LPR+radar). RFC 3550 §8.2 allows SSRC
             // changes with a RTCP BYE, but these cameras just change SSRC silently.
-            // Accept the new SSRC instead of disconnecting — the new encoder session
-            // will begin with an IDR keyframe, allowing the decoder to resync.
+            // Accept the new SSRC instead of disconnecting. Bump the change counter
+            // so the consumer can roll its MP4 segment — frames between the SSRC
+            // change and the next IDR reference the previous encoder's lost
+            // reference frames and decode as macroblock garbage if written into
+            // the same MP4 file.
             warn!(
                 "SSRC changed after {} RTP pkts + {} RTCP pkts; \
                  old={:?} new=0x{:08x} — accepting new SSRC (camera encoder restart)",
@@ -181,6 +199,7 @@ impl InorderParser {
                 ssrc,
             });
             self.seq = None;
+            self.ssrc_change_count += 1;
             loss = 0; // seq counter restarted; suppress large-loss error below
             timeline.reset(raw.timestamp()); // RTP timestamp also restarted
         } else if self.ssrc.is_none() {

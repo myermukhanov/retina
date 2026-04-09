@@ -986,6 +986,23 @@ impl Stream {
             StreamState::Playing { ctx, .. } => Some(ctx),
         }
     }
+
+    /// Returns the number of mid-session SSRC changes observed on this stream.
+    ///
+    /// Hikvision iDS AI cameras silently change SSRC when their encoder
+    /// restarts under load. We accept the new SSRC instead of disconnecting,
+    /// but the consumer should poll this counter and roll its MP4 segment
+    /// when it increments — frames between the SSRC change and the next IDR
+    /// reference the previous encoder's lost reference frames and decode as
+    /// macroblock garbage if written into the same MP4 file.
+    ///
+    /// Returns 0 when the stream is not in the `Playing` state.
+    pub fn ssrc_change_count(&self) -> u64 {
+        match &self.state {
+            StreamState::Playing { rtp_handler, .. } => rtp_handler.ssrc_change_count(),
+            _ => 0,
+        }
+    }
 }
 
 #[derive(Debug)]
